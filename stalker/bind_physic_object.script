@@ -1,0 +1,292 @@
+-- Physic objects binding; Разработчик: Evgeniy Negrobov (Jon) jon@gsc-game.kiev.ua
+-- Доработки: Andrey Fidrya (Zmey) af@svitonline.com; completed
+
+local watchdog = false
+
+function log( ... ) _util.log( "bind_physic_object", ...) end
+function abort( ... ) _util.abort( "bind_physic_object", ...) end
+
+local gg = game_graph()
+
+local path_exists = level.patrol_path_exists
+
+local load_obj, save_obj = xr_logic.load_obj, xr_logic.save_obj
+local issue_event = xr_logic.issue_event
+
+local c_projector = clsid.projector
+local c_car = clsid.car_s
+
+local mtype_itm = modules.stype_item
+
+local dbst = db.storage
+
+local t_online = xl_data.get_t_online()
+local t_npc_alive = t_online.npc_alive
+
+
+class "generic_physics_binder" ( object_binder )
+
+
+function generic_physics_binder:__init( item ) super( item )
+	self.initialized = false
+	self.loaded = false
+	self.item_id = item:id()
+	self.item_name = item:name()
+end
+
+
+function generic_physics_binder:reload( sect )
+	object_binder.reload( self, sect )
+end
+
+
+function generic_physics_binder:reinit()
+	if _G.watchdog then abort( "(%s):reinit, _G.watchdog: %s", self.item_name, _G.watchdog ) end
+	_G.watchdog = "generic_physics_binder:reinit " .. self.item_name
+
+	-- if string.find( self.item_name, "door" ) then
+	--	log( "info", "(%s):reinit ...", self.item_name )
+	-- end
+
+	object_binder.reinit( self )
+	local item = self.object
+	local id = self.item_id
+
+	local st = dbst[id]
+	if st then
+		self.st = st
+		if st.pstor then self.pstor = st.pstor
+		else st.pstor = {}; self.pstor = st.pstor
+		end
+	else
+		local pstor = {}
+		self.pstor = pstor
+		st = { ["pstor"] = pstor }
+		self.st = st
+		dbst[id] = st
+	end
+	local c = item:get_car()
+	if c then self.health = c:GetfHealth() end
+
+	-- if string.find( self.item_name, "door" ) then
+	--	log( "info", "(%s):reinit, ok", self.item_name )
+	-- end
+	_G.watchdog = false
+end
+
+
+function generic_physics_binder:net_save_relevant() return true end
+
+
+function generic_physics_binder:save( pk )
+	if _G.watchdog then abort( "(%s):save, _G.watchdog: %s", self.item_name, _G.watchdog ) end
+	_G.watchdog = "generic_physics_binder:save " .. self.item_name
+
+	object_binder.save( self, pk )
+	save_obj( self.object, pk )
+
+	if ( dbst[self.item_id].ini_filename or "" ) == "" then
+		log( "error", "(%s):save, object not inited, (i: %s, a: %s)", self.item_name,
+			tostring( self.initialized ), tostring( dbst[self.item_id].active_section ) )
+		_G.sv_err = true
+	end
+
+	_G.watchdog = false
+end
+
+
+function generic_physics_binder:load( pk )
+	if _G.watchdog then abort( "(%s):load, _G.watchdog: %s", self.item_name, _G.watchdog ) end
+	_G.watchdog = "generic_physics_binder:load " .. self.item_name
+
+	object_binder.load( self, pk )
+	load_obj( self.object, pk )
+	self.loaded = true
+
+	_G.watchdog = false
+end
+
+
+function generic_physics_binder:use_callback( item, who )
+	-- log( "info", "(%s):use ...", self.item_name )
+	local st = self.st
+	if st.active_section then
+		issue_event( self.object, st[st.active_scheme], "use_callback", item, who )
+	end
+	if self.ph_snd then
+		-- log( "info", "(%s):use, %s", tostring( self.item_name ), tostring( self.pstor.ph_snd ) )
+		if self.pstor.ph_snd == 0 then
+			self.pstor.ph_snd = 1
+			self.object:set_tip_text( "Выключить" )
+		elseif not self.pstor ~= 2 then
+			self.pstor.ph_snd = 0
+			self.object:set_tip_text( "Включить" )
+	end	end
+end
+
+
+
+function generic_physics_binder:update( delta )
+	if watchdog then
+		_G.watchdog = watchdog
+		abort( "(%s):update, watchdog: %s", self.item_name, watchdog )
+	end
+	watchdog = "generic_physics_binder:update " .. self.item_name
+
+	local item = self.object
+	local st = self.st
+
+	object_binder.update( self, delta )
+	if not self.initialized then
+
+		if self.loaded and ( st.loaded_ini_filename or "" ) == "" then
+			log( "error", "(%s):update, init, save file corrupted", self.item_name )
+		end
+
+		self.initialized = true	-- закомментить при отладке
+		xr_logic.initialize_obj( item, st, self.loaded, actor, modules.stype_item )
+
+		-- Запускаем ассоциированный с объектом партикл.
+		local s = utils.cfg_get_string( st.ini, st.section_logic, "particle", item, false, "", nil )
+		if s then
+			self.particle = particles_object( s )
+			self.particle:play_at_pos( item:position() )
+		end
+
+		-- Дизаблим ассоциированный с объектом граф
+		local graph_point_marker = utils.cfg_get_string( st.ini, st.section_logic, "graph_point_marker", self.object,false, "", nil )
+		if graph_point_marker then
+			self.disable_graph_point = patrol( graph_point_marker ):game_vertex_id( 0 )
+			game_graph():accessible( self.disable_graph_point, false )
+		end
+
+		local ini = st.ini
+		if ini and ini:section_exist( "logic" ) and ini:line_exist( "logic", "active" ) then
+			local s = ini:r_string( "logic", "active" )
+			if s and string.match( s, "ph_sound" ) then
+				self.ph_snd = true
+				-- log( "info", "(%s):update, init, ph_sound present", self.item_name )
+				if self.pstor.ph_snd ~= 2 then
+					if self.pstor.ph_snd == 0 then item:set_tip_text( "Включить" )
+					else
+						self.pstor.ph_snd = 1
+						item:set_tip_text( "Выключить" )
+				end	end
+			end
+		end
+	end
+	if st.active_section or ( item:spawn_ini()
+	  and item:spawn_ini():section_exist( "drop_box" ) ) then
+		watchdog = false
+		xr_logic.issue_event( item, st[st.active_scheme], "update", delta )
+			item:set_callback( callback.hit, generic_physics_binder.hit_callback, self )
+			item:set_callback( callback.death, generic_physics_binder.death_callback, self )
+			item:set_callback( callback.use_object, generic_physics_binder.use_callback, self )
+
+		-- для бтра hit_callback не вызывается. заткнём эту дырку.
+		if self.health and ( not self.nofixonhit ) then
+			local health = item:get_car() and item:get_car():GetfHealth()
+			if health then
+				if self.health - health > 0.00001 then
+					self.health = health
+					self:hit_callback( item, self.health - health, vector():set( 1, 0, 0 ), actor, 0 )
+					self.nofixonhit = false
+				end
+			end
+		end
+	end
+	-- if not self.initialized then	-- отладка !
+	--	self.initialized = true
+	--	log( "info", "(%s):update, init, ok", self.item_name )
+	-- end
+	watchdog = false
+end
+
+
+function generic_physics_binder:net_spawn( data )
+	if not object_binder.net_spawn( self, data ) then
+		return false
+	end
+	local item = self.object
+	local cls = item:clsid()
+	if cls == c_projector then
+		db.add_sl( item )
+	elseif cls == c_car then
+		local h = hit()
+		h.power = 0
+		h.impulse = 0.0001
+		h.draftsman = item
+		h.direction = vector():set( 0, 0, 0 )
+		h.type = hit.strike
+		item:hit(h)
+	end
+	return true
+end
+
+
+function generic_physics_binder:net_destroy()
+	local item = self.object
+	local st = self.st
+	if st.active_scheme then
+		xr_logic.issue_event( item, st[st.active_scheme], "net_destroy" )
+	end
+	if self.particle then self.particle:stop() end
+	if item:clsid() == clsid.projector then db.del_sl( item )
+	end
+	db.storage[item:id()] = nil
+	object_binder.net_destroy( self )
+end
+
+
+function generic_physics_binder:hit_callback( victim, amount, dir, who, bone_idx )
+	self.nofixonhit = true
+	local st = self.st
+	local item = self.object
+	if self.ph_snd and ( amount >= 0.2 ) then
+		-- log( "info", "(%s):hit_callback, %s (%s)", tostring( self.item_name ), tostring( amount ), tostring( self.pstor.ph_snd ) )
+		self.pstor.ph_snd = 2
+		item:set_tip_text( "" )
+	end
+
+	if st.ph_on_hit then
+		xr_logic.issue_event( item, st.ph_on_hit, "hit_callback", victim, amount, dir, who, bone_idx )
+	end
+	if st.active_section then
+		xr_logic.issue_event( item, st[st.active_scheme], "hit_callback", victim, amount, dir, who, bone_idx )
+	end
+end
+
+
+function generic_physics_binder:death_callback( victim, who )
+	local st = self.st
+	local item = self.object
+	local ini = item:spawn_ini()
+	if st.active_section then
+		xr_logic.issue_event( item, st[st.active_scheme], "death_callback", victim, who )
+	end
+	if self.particle then
+		self.particle:stop()
+	end
+	if self.disable_graph_point then
+		game_graph():accessible( self.disable_graph_point, true )
+	end
+	if ini and ini:section_exist( "drop_box" ) then xr_box.spawn_items( item ) end
+end
+
+
+function init( item )
+	-- log( "info", "init, %s ...", item:name() )
+
+	local ini = item:spawn_ini()
+	if ( ini and ( ini:section_exist( "drop_box" ) or ini:section_exist( "logic" ) ) )
+	  or item:clsid() == c_projector then
+		db.storage[item:id()] = {}
+		local new_binder = generic_physics_binder( item )
+		item:bind_object( new_binder )
+	end
+
+	-- log( "info", "init, %s: ok (no bind)", item:name() )
+end
+
+
+log( "module", "ok" )
